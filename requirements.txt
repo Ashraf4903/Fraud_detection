@@ -1,0 +1,36 @@
+# ============================================================
+# AI-Based Fraud Detection System - Requirements
+# ============================================================
+
+# Core Data Science
+numpy==1.26.4
+pandas==2.2.1
+scikit-learn==1.4.1
+imbalanced-learn==0.12.0     # SMOTE for handling class imbalance
+joblib==1.3.2                # Model serialization
+
+# Visualization
+matplotlib==3.8.3
+seaborn==0.13.2
+plotly==5.20.0               # Interactive charts for Streamlit
+
+# API Layer
+fastapi==0.110.0
+uvicorn[standard]==0.28.0    # ASGI server for FastAPI
+pydantic==2.6.3              # Data validation
+
+# Frontend
+streamlit==1.32.2
+requests==2.31.0             # HTTP calls from Streamlit to API
+
+# Logging & Utilities
+python-json-logger==2.0.7    # Structured JSON logging
+python-dotenv==1.0.1         # Environment variable management
+
+# Security (API)
+python-jose[cryptography]==3.3.0   # JWT tokens (optional auth layer)
+passlib[bcrypt]==1.7.4             # Password hashing
+
+# Jupyter (optional, for notebooks)
+jupyter==1.0.0
+ipykernel==6.29.3

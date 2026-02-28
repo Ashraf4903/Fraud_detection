@@ -1,0 +1,16 @@
+# Python environment
+venv/
+__pycache__/
+.pytest_cache/
+
+# Environment variables (Security!)
+.env
+
+# Datasets (Too large for GitHub)
+data/
+
+# Machine Learning models (Too large/binary)
+model/*.joblib
+
+# VS Code settings
+.vscode/
