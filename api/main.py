@@ -1,17 +1,20 @@
 """
 ============================================================
-AI-Based Fraud Detection System - FastAPI REST Service
+Enhanced Fraud Detection API - With Anomaly Detection
 ============================================================
-Endpoints:
-  POST /predict   → Accept transaction features, return fraud probability
-  GET  /health    → Health check (useful for load balancers / k8s probes)
-  GET  /model-info → Return model metadata (threshold, version, metrics)
+This enhanced version includes:
+  1. Original supervised model endpoint (Random Forest)
+  2. Anomaly detection endpoint (Isolation Forest)
+  3. Hybrid prediction combining both models
+  4. Anomaly visualization data endpoint
 
-Security Notes (see comments throughout):
-  - API key authentication via X-API-Key header
-  - Rate limiting recommendation included
-  - Input validation via Pydantic models
-  - Structured JSON logging for observability
+Endpoints:
+  POST /predict              → Supervised classification
+  POST /predict-anomaly      → Unsupervised anomaly detection
+  POST /predict-hybrid       → Combined prediction
+  GET  /anomaly-stats        → Anomaly detection statistics
+  GET  /health               → Health check
+  GET  /model-info           → Model metadata
 ============================================================
 """
 
@@ -20,7 +23,7 @@ import json
 import time
 import logging
 import traceback
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import joblib
 import numpy as np
@@ -30,7 +33,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, validator
 from pythonjsonlogger import jsonlogger
 
-# ── Structured JSON Logging (production-ready) ──────────────────────────────
+# ── Structured JSON Logging ──────────────────────────────────────────────────
 logger = logging.getLogger("fraud_api")
 handler = logging.StreamHandler()
 formatter = jsonlogger.JsonFormatter(
@@ -41,30 +44,25 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, "model", "fraud_model.joblib")
-SCALER_PATH= os.path.join(BASE_DIR, "model", "scaler.joblib")
-META_PATH  = os.path.join(BASE_DIR, "model", "metadata.json")
+BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_PATH      = os.path.join(BASE_DIR, "model", "fraud_model.joblib")
+SCALER_PATH     = os.path.join(BASE_DIR, "model", "scaler.joblib")
+META_PATH       = os.path.join(BASE_DIR, "model", "metadata.json")
+
+ANOMALY_MODEL   = os.path.join(BASE_DIR, "model", "anomaly", "isolation_forest.joblib")
+ANOMALY_SCALER  = os.path.join(BASE_DIR, "model", "anomaly", "anomaly_scaler.joblib")
+ANOMALY_META    = os.path.join(BASE_DIR, "model", "anomaly", "anomaly_metadata.json")
 
 # ── API Key Security ─────────────────────────────────────────────────────────
-# In production: store this in an environment variable / secrets manager
-# (AWS Secrets Manager, HashiCorp Vault, etc.)
-API_KEY         = os.getenv("FRAUD_API_KEY", "demo-api-key-change-in-production")
-api_key_header  = APIKeyHeader(name="X-API-Key", auto_error=False)
+API_KEY        = os.getenv("FRAUD_API_KEY", "demo-api-key-change-in-production")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def verify_api_key(key: Optional[str] = Depends(api_key_header)):
-    """
-    Simple API-key gate.  In a real production setup you would:
-      1. Store keys hashed in a database (bcrypt / argon2)
-      2. Implement per-key rate limiting (Redis + sliding window)
-      3. Rotate keys periodically and log key usage
-      4. Consider OAuth2 / JWT for multi-tenant scenarios
-    """
     if key != API_KEY:
         logger.warning("Unauthorized API access attempt")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key.  Pass X-API-Key header.",
+            detail="Invalid or missing API key.",
         )
     return key
 
@@ -74,37 +72,51 @@ def verify_api_key(key: Optional[str] = Depends(api_key_header)):
 # ════════════════════════════════════════════════════════════════════════════
 
 app = FastAPI(
-    title       = "Fraud Detection API",
-    description = "Real-time credit card fraud detection powered by Random Forest",
-    version     = "1.0.0",
-    docs_url    = "/docs",   # Swagger UI at /docs
+    title       = "Enhanced Fraud Detection API",
+    description = "Real-time fraud detection with supervised + unsupervised learning",
+    version     = "2.0.0",
+    docs_url    = "/docs",
     redoc_url   = "/redoc",
 )
 
-# CORS – restrict origins in production (currently open for demo)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = ["*"],   # ← change to your Streamlit URL in production
+    allow_origins     = ["*"],
     allow_credentials = True,
     allow_methods     = ["*"],
     allow_headers     = ["*"],
 )
 
-# ── Load model at startup (once, not per-request) ────────────────────────────
-model, scaler, metadata = None, None, {}
+# ── Load models at startup ────────────────────────────────────────────────────
+rf_model, rf_scaler, rf_metadata = None, None, {}
+anomaly_model, anomaly_scaler, anomaly_metadata = None, None, {}
 
 @app.on_event("startup")
-async def load_model():
-    global model, scaler, metadata
+async def load_models():
+    global rf_model, rf_scaler, rf_metadata
+    global anomaly_model, anomaly_scaler, anomaly_metadata
+    
+    # Load supervised model
     try:
-        model   = joblib.load(MODEL_PATH)
-        scaler  = joblib.load(SCALER_PATH)
+        rf_model   = joblib.load(MODEL_PATH)
+        rf_scaler  = joblib.load(SCALER_PATH)
         with open(META_PATH) as f:
-            metadata = json.load(f)
-        logger.info("Model loaded successfully", extra={"model_type": metadata.get("model_type")})
+            rf_metadata = json.load(f)
+        logger.info("Random Forest model loaded", 
+                   extra={"model_type": rf_metadata.get("model_type")})
     except FileNotFoundError:
-        # Allow the API to start even without a model (useful for health checks)
-        logger.error("Model files not found. Run model/train.py first!")
+        logger.error("Random Forest model not found. Run model/train.py first!")
+    
+    # Load anomaly detection model
+    try:
+        anomaly_model  = joblib.load(ANOMALY_MODEL)
+        anomaly_scaler = joblib.load(ANOMALY_SCALER)
+        with open(ANOMALY_META) as f:
+            anomaly_metadata = json.load(f)
+        logger.info("Anomaly detector loaded", 
+                   extra={"model_type": anomaly_metadata.get("model_type")})
+    except FileNotFoundError:
+        logger.warning("Anomaly detector not found. Run train_anomaly_detector.py")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -112,15 +124,10 @@ async def load_model():
 # ════════════════════════════════════════════════════════════════════════════
 
 class TransactionRequest(BaseModel):
-    """
-    Mirrors the Kaggle dataset features after preprocessing.
-    V1-V28 are PCA features; Amount and Time are raw and will be scaled
-    server-side exactly as they were during training.
-    """
-    Time   : float = Field(..., description="Seconds since first transaction in dataset")
-    Amount : float = Field(..., ge=0, description="Transaction amount in EUR (must be ≥ 0)")
-
-    # PCA-transformed features (anonymised)
+    """Standard transaction features."""
+    Time   : float = Field(..., description="Seconds since first transaction")
+    Amount : float = Field(..., ge=0, description="Transaction amount (EUR)")
+    
     V1  : float;  V2  : float;  V3  : float;  V4  : float
     V5  : float;  V6  : float;  V7  : float;  V8  : float
     V9  : float;  V10 : float;  V11 : float;  V12 : float
@@ -128,53 +135,53 @@ class TransactionRequest(BaseModel):
     V17 : float;  V18 : float;  V19 : float;  V20 : float
     V21 : float;  V22 : float;  V23 : float;  V24 : float
     V25 : float;  V26 : float;  V27 : float;  V28 : float
-
+    
     @validator("Amount")
     def amount_must_be_positive(cls, v):
         if v < 0:
             raise ValueError("Amount cannot be negative")
         return v
 
-    class Config:
-        schema_extra = {
-            "example": {
-                "Time": 406, "Amount": 149.62,
-                "V1": -1.36, "V2": -0.07, "V3": 2.54, "V4": 1.38,
-                "V5": -0.34, "V6": 0.46, "V7": 0.24, "V8": 0.10,
-                "V9": 0.36, "V10": 0.09, "V11": -0.55, "V12": -0.62,
-                "V13": -0.99, "V14": -0.31, "V15": 1.47, "V16": -0.47,
-                "V17": 0.21, "V18": 0.03, "V19": 0.40, "V20": 0.25,
-                "V21": -0.02, "V22": 0.28, "V23": -0.11, "V24": 0.07,
-                "V25": 0.13, "V26": -0.19, "V27": 0.13, "V28": -0.02,
-            }
-        }
-
 
 class PredictionResponse(BaseModel):
-    """What the API returns for each transaction."""
-    prediction       : int    # 0 = Legit, 1 = Fraud
-    fraud_probability: float  # Raw model probability [0.0 – 1.0]
-    risk_level       : str    # "Low" | "Medium" | "High"
-    risk_score       : int    # Numeric score 0–100 for UI gauges
+    """Standard supervised prediction response."""
+    prediction       : int
+    fraud_probability: float
+    risk_level       : str
+    risk_score       : int
     threshold_used   : float
     inference_time_ms: float
     model_version    : str
 
 
+class AnomalyResponse(BaseModel):
+    """Anomaly detection response."""
+    is_anomaly       : bool
+    anomaly_score    : float  # 0-100, higher = more anomalous
+    anomaly_level    : str    # "Normal" | "Suspicious" | "Highly Anomalous"
+    threshold_used   : float
+    inference_time_ms: float
+    behavioral_flags : Dict[str, bool]
+
+
+class HybridResponse(BaseModel):
+    """Combined prediction from both models."""
+    final_prediction      : int
+    confidence           : float
+    supervised_pred      : int
+    supervised_prob      : float
+    anomaly_score        : float
+    risk_assessment      : str
+    model_agreement      : bool
+    inference_time_ms    : float
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# RISK SCORING HELPER
+# HELPER FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════
 
 def compute_risk(fraud_prob: float) -> Tuple[str, int]:
-    """
-    Map raw fraud probability to a human-readable risk tier and
-    a 0-100 numeric score for visualisation in the frontend.
-
-      Probability Range → Risk Level  → Score Range
-      0.00 – 0.30       → Low         → 0  – 29
-      0.30 – 0.70       → Medium      → 30 – 69
-      0.70 – 1.00       → High        → 70 – 100
-    """
+    """Map probability to risk level."""
     score = int(fraud_prob * 100)
     if fraud_prob < 0.30:
         level = "Low"
@@ -185,108 +192,323 @@ def compute_risk(fraud_prob: float) -> Tuple[str, int]:
     return level, score
 
 
+def compute_anomaly_level(anomaly_score: float) -> str:
+    """Map anomaly score to category."""
+    if anomaly_score < 40:
+        return "Normal"
+    elif anomaly_score < 70:
+        return "Suspicious"
+    else:
+        return "Highly Anomalous"
+
+
+def extract_behavioral_flags(features: np.ndarray, anomaly_score: float) -> Dict[str, bool]:
+    """
+    Analyze transaction features for behavioral anomalies.
+    Returns flags for different types of suspicious patterns.
+    """
+    flags = {
+        'unusual_amount': False,
+        'unusual_timing': False,
+        'unusual_pattern': False,
+        'high_risk_features': False
+    }
+    
+    # Amount analysis (assume index 28 is scaled_amount)
+    if len(features[0]) > 28:
+        amount_val = abs(features[0][28])
+        if amount_val > 3.0:  # More than 3 std devs
+            flags['unusual_amount'] = True
+    
+    # Timing analysis (assume index 29 is scaled_time)
+    if len(features[0]) > 29:
+        time_val = abs(features[0][29])
+        if time_val > 2.5:
+            flags['unusual_timing'] = True
+    
+    # Pattern analysis based on V features
+    v_features = features[0][:28]
+    extreme_count = np.sum(np.abs(v_features) > 3.0)
+    if extreme_count >= 3:
+        flags['unusual_pattern'] = True
+    
+    # Overall risk
+    if anomaly_score > 70:
+        flags['high_risk_features'] = True
+    
+    return flags
+
+
+def prepare_features_for_rf(transaction: TransactionRequest) -> np.ndarray:
+    """Prepare features for Random Forest (supervised model)."""
+    feature_dict = transaction.dict()
+    amount = feature_dict.pop("Amount")
+    time_  = feature_dict.pop("Time")
+    
+    # Scale Amount and Time
+    scaled_values = rf_scaler.transform([[amount, time_]])
+    scaled_amount = scaled_values[0][0]
+    scaled_time   = scaled_values[0][1]
+    
+    # Build feature array
+    feature_names = rf_metadata.get("feature_names", [])
+    feature_map = {**feature_dict, "scaled_amount": scaled_amount, "scaled_time": scaled_time}
+    
+    features = np.array([[feature_map[f] for f in feature_names]])
+    return features
+
+
+def prepare_features_for_anomaly(transaction: TransactionRequest) -> np.ndarray:
+    """Prepare features for Isolation Forest (anomaly detector)."""
+    feature_dict = transaction.dict()
+    
+    # Build feature array in correct order
+    features = []
+    for i in range(1, 29):
+        features.append(feature_dict[f'V{i}'])
+    features.append(feature_dict['Amount'])
+    features.append(feature_dict['Time'])
+    
+    X = np.array([features])
+    
+    # Scale Amount and Time columns (indices 28, 29)
+    X[:, [28, 29]] = anomaly_scaler.transform(X[:, [28, 29]])
+    
+    return X
+
+
+def compute_anomaly_score_normalized(model, X: np.ndarray) -> float:
+    """
+    Convert Isolation Forest decision scores to 0-100 scale.
+    """
+    decision_score = model.decision_function(X)[0]
+    
+    # Empirical normalization based on training distribution
+    # Typical range: [-0.5, 0.5], but can vary
+    # Negative = anomaly, Positive = normal
+    
+    # Simple linear mapping: normalize to 0-100
+    # More negative = higher anomaly score
+    normalized = 50 - (decision_score * 100)
+    normalized = np.clip(normalized, 0, 100)
+    
+    return float(normalized)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health", tags=["System"])
 async def health_check():
-    """
-    Lightweight health probe.
-    Returns 200 if the API is running and the model is loaded.
-    Kubernetes liveness/readiness probes should hit this endpoint.
-    """
-    model_loaded = model is not None
+    """Health check endpoint."""
+    rf_loaded = rf_model is not None
+    anomaly_loaded = anomaly_model is not None
+    
     return {
-        "status"      : "healthy" if model_loaded else "degraded",
-        "model_loaded": model_loaded,
-        "model_type"  : metadata.get("model_type", "unknown"),
+        "status": "healthy" if rf_loaded else "degraded",
+        "supervised_model_loaded": rf_loaded,
+        "anomaly_model_loaded": anomaly_loaded,
+        "model_type": rf_metadata.get("model_type", "unknown"),
     }
 
 
 @app.get("/model-info", tags=["System"])
 async def model_info():
-    """
-    Return model metadata for the frontend dashboard.
-    Useful for showing the user what model version is running.
-    """
-    if not metadata:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    """Return combined model metadata."""
+    if not rf_metadata:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+    
+    return {
+        "supervised": {k: v for k, v in rf_metadata.items() if k != "y_proba"},
+        "anomaly": {k: v for k, v in anomaly_metadata.items() if k != "anomaly_scores"}
+    }
 
-    # Strip y_proba from the response (it's training-time data, not needed here)
-    safe_meta = {k: v for k, v in metadata.items() if k not in ("y_proba",)}
-    return safe_meta
+
+@app.get("/anomaly-stats", tags=["Anomaly Detection"])
+async def anomaly_stats():
+    """Return anomaly detection statistics."""
+    if not anomaly_metadata:
+        raise HTTPException(status_code=503, detail="Anomaly detector not loaded")
+    
+    return {
+        "model_type": anomaly_metadata.get("model_type"),
+        "threshold": anomaly_metadata.get("threshold"),
+        "contamination": anomaly_metadata.get("contamination"),
+        "metrics": anomaly_metadata.get("metrics", {}),
+        "trained_at": anomaly_metadata.get("trained_at")
+    }
 
 
 @app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
-async def predict(
-    transaction : TransactionRequest,
-    request     : Request,
-    api_key     : str = Depends(verify_api_key),
+async def predict_supervised(
+    transaction: TransactionRequest,
+    request: Request,
+    api_key: str = Depends(verify_api_key),
 ):
     """
-    Main inference endpoint.
-
-    Accepts a JSON body with all transaction features and returns:
-      - prediction       : 0 (Legit) or 1 (Fraud)
-      - fraud_probability: model confidence that this is fraud
-      - risk_level       : Low / Medium / High
-      - risk_score       : 0–100 numeric score
-      - inference_time_ms: how long the model took to respond
+    Supervised learning prediction using Random Forest.
+    Original endpoint - maintains backward compatibility.
     """
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded. Run model/train.py first.")
-
-    # ── Build feature vector in the exact same order as training ─
-    feature_dict = transaction.dict()
-    amount = feature_dict.pop("Amount")
-    time_  = feature_dict.pop("Time")
-
-    # Scale Amount and Time (same scaler used during training)
-    # Note: we use transform (not fit_transform) – scaler is already fitted
-    scaled_values = scaler.transform([[amount, time_]])
-    scaled_amount = scaled_values[0][0]
-    scaled_time   = scaled_values[0][1]
-
-    # Build ordered feature array matching metadata["feature_names"]
-    feature_names = metadata.get("feature_names", [])
-    feature_map   = {**feature_dict, "scaled_amount": scaled_amount, "scaled_time": scaled_time}
-
-    try:
-        features = np.array([[feature_map[f] for f in feature_names]])
-    except KeyError as e:
-        raise HTTPException(status_code=422, detail=f"Missing feature in input: {e}")
-
-    # ── Inference ────────────────────────────────────────────────
-    t_start      = time.perf_counter()
-    fraud_proba  = float(model.predict_proba(features)[0][1])
+    if rf_model is None:
+        raise HTTPException(status_code=503, detail="Supervised model not loaded")
+    
+    # Prepare features
+    features = prepare_features_for_rf(transaction)
+    
+    # Inference
+    t_start = time.perf_counter()
+    fraud_proba = float(rf_model.predict_proba(features)[0][1])
     inference_ms = (time.perf_counter() - t_start) * 1000
-
-    threshold    = metadata.get("threshold", 0.5)
-    prediction   = int(fraud_proba >= threshold)
+    
+    threshold = rf_metadata.get("threshold", 0.5)
+    prediction = int(fraud_proba >= threshold)
     risk_level, risk_score = compute_risk(fraud_proba)
-
-    # ── Structured Logging (feeds into Datadog / ELK / CloudWatch) ──
+    
     logger.info(
-        "Prediction completed",
+        "Supervised prediction",
         extra={
-            "prediction"       : prediction,
+            "prediction": prediction,
             "fraud_probability": round(fraud_proba, 4),
-            "risk_level"       : risk_level,
-            "inference_ms"     : round(inference_ms, 3),
-            "amount"           : amount,
-            "client_ip"        : request.client.host if request.client else "unknown",
+            "risk_level": risk_level,
+            "inference_ms": round(inference_ms, 3),
         },
     )
-
+    
     return PredictionResponse(
-        prediction        = prediction,
-        fraud_probability = round(fraud_proba, 4),
-        risk_level        = risk_level,
-        risk_score        = risk_score,
-        threshold_used    = threshold,
-        inference_time_ms = round(inference_ms, 3),
-        model_version     = metadata.get("model_type", "RandomForest") + "-v1.0",
+        prediction=prediction,
+        fraud_probability=round(fraud_proba, 4),
+        risk_level=risk_level,
+        risk_score=risk_score,
+        threshold_used=threshold,
+        inference_time_ms=round(inference_ms, 3),
+        model_version=rf_metadata.get("model_type", "RandomForest") + "-v1.0",
+    )
+
+
+@app.post("/predict-anomaly", response_model=AnomalyResponse, tags=["Anomaly Detection"])
+async def predict_anomaly(
+    transaction: TransactionRequest,
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Unsupervised anomaly detection using Isolation Forest.
+    Detects transactions that deviate from normal behavioral patterns.
+    """
+    if anomaly_model is None:
+        raise HTTPException(status_code=503, detail="Anomaly detector not loaded")
+    
+    # Prepare features
+    features = prepare_features_for_anomaly(transaction)
+    
+    # Inference
+    t_start = time.perf_counter()
+    
+    # Get anomaly score (0-100)
+    anomaly_score = compute_anomaly_score_normalized(anomaly_model, features)
+    
+    # Prediction
+    threshold = anomaly_metadata.get("threshold", 50.0)
+    is_anomaly = anomaly_score >= threshold
+    anomaly_level = compute_anomaly_level(anomaly_score)
+    
+    # Behavioral analysis
+    behavioral_flags = extract_behavioral_flags(features, anomaly_score)
+    
+    inference_ms = (time.perf_counter() - t_start) * 1000
+    
+    logger.info(
+        "Anomaly prediction",
+        extra={
+            "is_anomaly": is_anomaly,
+            "anomaly_score": round(anomaly_score, 2),
+            "anomaly_level": anomaly_level,
+            "inference_ms": round(inference_ms, 3),
+        },
+    )
+    
+    return AnomalyResponse(
+        is_anomaly=is_anomaly,
+        anomaly_score=round(anomaly_score, 2),
+        anomaly_level=anomaly_level,
+        threshold_used=threshold,
+        inference_time_ms=round(inference_ms, 3),
+        behavioral_flags=behavioral_flags,
+    )
+
+
+@app.post("/predict-hybrid", response_model=HybridResponse, tags=["Prediction"])
+async def predict_hybrid(
+    transaction: TransactionRequest,
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Hybrid prediction combining supervised and unsupervised models.
+    Provides the most robust fraud detection by leveraging both approaches.
+    
+    Decision Logic:
+      - If BOTH models flag as fraud → High confidence fraud
+      - If ONE model flags → Medium confidence fraud (manual review)
+      - If NEITHER flags → Legitimate transaction
+    """
+    if rf_model is None or anomaly_model is None:
+        raise HTTPException(status_code=503, detail="Models not fully loaded")
+    
+    t_start = time.perf_counter()
+    
+    # Get supervised prediction
+    rf_features = prepare_features_for_rf(transaction)
+    supervised_prob = float(rf_model.predict_proba(rf_features)[0][1])
+    supervised_threshold = rf_metadata.get("threshold", 0.5)
+    supervised_pred = int(supervised_prob >= supervised_threshold)
+    
+    # Get anomaly prediction
+    anomaly_features = prepare_features_for_anomaly(transaction)
+    anomaly_score = compute_anomaly_score_normalized(anomaly_model, anomaly_features)
+    anomaly_threshold = anomaly_metadata.get("threshold", 50.0)
+    anomaly_pred = int(anomaly_score >= anomaly_threshold)
+    
+    # Combine predictions
+    model_agreement = (supervised_pred == anomaly_pred)
+    
+    if supervised_pred == 1 and anomaly_pred == 1:
+        final_prediction = 1
+        confidence = 0.95
+        risk_assessment = "CRITICAL: Both models detected fraud"
+    elif supervised_pred == 1 or anomaly_pred == 1:
+        final_prediction = 1
+        confidence = 0.75
+        risk_assessment = "HIGH: One model detected fraud - Recommend manual review"
+    else:
+        final_prediction = 0
+        confidence = 0.90
+        risk_assessment = "LOW: Transaction appears legitimate"
+    
+    inference_ms = (time.perf_counter() - t_start) * 1000
+    
+    logger.info(
+        "Hybrid prediction",
+        extra={
+            "final_prediction": final_prediction,
+            "supervised_pred": supervised_pred,
+            "anomaly_pred": anomaly_pred,
+            "model_agreement": model_agreement,
+            "confidence": confidence,
+            "inference_ms": round(inference_ms, 3),
+        },
+    )
+    
+    return HybridResponse(
+        final_prediction=final_prediction,
+        confidence=round(confidence, 3),
+        supervised_pred=supervised_pred,
+        supervised_prob=round(supervised_prob, 4),
+        anomaly_score=round(anomaly_score, 2),
+        risk_assessment=risk_assessment,
+        model_agreement=model_agreement,
+        inference_time_ms=round(inference_ms, 3),
     )
 
 
@@ -297,9 +519,9 @@ async def predict(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "main:app",
-        host    = "0.0.0.0",
-        port    = 8000,
-        reload  = True,   # Auto-reload on code changes (dev only – disable in prod)
-        workers = 1,      # Increase to CPU cores in production
+        "main_enhanced:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        workers=1,
     )
