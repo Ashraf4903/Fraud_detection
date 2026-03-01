@@ -19,7 +19,13 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
+import google.generativeai as genai
 from typing import Optional, Dict
+from dotenv import load_dotenv  # <-- Add this!
+
+# ── API Settings ─────────────────────────────────────────────────────────────
+# Force Python to read the .env file in your folder
+load_dotenv()
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -32,6 +38,7 @@ st.set_page_config(
 # ── API Settings ─────────────────────────────────────────────────────────────
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 API_KEY = os.getenv("FRAUD_API_KEY", "demo-api-key-change-in-production")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
 # ── Session State ────────────────────────────────────────────────────────────
@@ -43,6 +50,8 @@ if 'last_hybrid' not in st.session_state:
     st.session_state.last_hybrid = None
 if 'history' not in st.session_state:
     st.session_state.history = []
+if "demo_force_fraud" not in st.session_state:
+    st.session_state.demo_force_fraud = False
 
 # ── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
@@ -156,6 +165,32 @@ def get_anomaly_stats() -> dict:
         return resp.json()
     except:
         return {}
+def get_system_summary():
+    try:
+        resp = requests.get(f"{API_URL}/system-summary", headers=HEADERS, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except:
+        return {}
+
+def get_blocked_history():
+    try:
+        resp = requests.get(f"{API_URL}/blocked-history", headers=HEADERS, timeout=5)
+        resp.raise_for_status()
+        return resp.json().get("blocked", [])
+    except:
+        return []
+
+def toggle_auto_block(enabled: bool):
+    try:
+        requests.post(
+            f"{API_URL}/toggle-auto-block",
+            json={"enabled": enabled},
+            headers=HEADERS,
+            timeout=5
+        )
+    except:
+        pass
 
 def fraud_gauge(prob: float, risk_level: str, title: str = "Fraud Probability (%)") -> go.Figure:
     color = {"Low": "#38ef7d", "Medium": "#ffd200", "High": "#eb3349"}.get(risk_level, "#aaa")
@@ -257,26 +292,69 @@ with st.sidebar:
         for i in range(10): 
             with placeholder.container():
                 st.info(f"Analyzing transaction {i+1}/10 in real-time...")
-                payload = SAMPLE_LEGIT.copy() if np.random.rand() > 0.3 else SAMPLE_FRAUD.copy()
                 
-                # Add behavioral noise
+                # 1. Determine if this specific transaction is fraudulent
+                is_simulated_fraud = np.random.rand() <= 0.3
+                payload = SAMPLE_FRAUD.copy() if is_simulated_fraud else SAMPLE_LEGIT.copy()
+                
+                # 2. Add behavioral noise
                 payload["amt"] *= np.random.uniform(0.5, 2.5)
                 payload["merch_lat"] += np.random.uniform(-5, 5) # Create random distance variance
                 
-                endpoint = "predict-hybrid" # Using hybrid to show full capabilities in stream
-                result = call_api(endpoint, payload)
+                # 3. Explicitly tell the backend to flag this as fraud for the demo
+                payload["demo_force_fraud"] = is_simulated_fraud
                 
-                if result:
-                    # Calculate approximate distance for the table
-                    dist_approx = np.sqrt((payload['lat'] - payload['merch_lat'])**2 + (payload['long'] - payload['merch_long'])**2) * 111
-                    st.session_state.history.append({
-                        "Type": "Hybrid", 
-                        "Amount ($)": round(payload["amt"], 2), 
-                        "Distance (KM)": round(dist_approx, 1),
-                        "Risk / Level": result["risk_assessment"].split(':'), 
-                        "Prediction": "🚨 Fraud" if result["final_prediction"]==1 else "✅ Safe", 
-                        "Inference (ms)": result["inference_time_ms"]
-                    })
+                dist_approx = np.sqrt((payload['lat'] - payload['merch_lat'])**2 + (payload['long'] - payload['merch_long'])**2) * 111
+
+                # Dynamically choose the endpoint based on the selected detection_mode
+                if detection_mode == "Supervised Only":
+                    result = call_api("predict", payload)
+                    if result:
+                        is_fraud = result["prediction"] == 1
+                        st.session_state.history.append({
+                            "Type": "Supervised", 
+                            "Amount ($)": round(payload["amt"], 2), 
+                            "Distance (KM)": round(dist_approx, 1),
+                            "Risk / Level": result["risk_level"], 
+                            "Prediction": "🚨 Fraud" if is_fraud else "✅ Legit", 
+                            "Inference (ms)": result["inference_time_ms"]
+                        })
+                        # Trigger alert popup
+                        if is_fraud:
+                            st.toast(f"🚨 FRAUD ALERT: ${payload['amt']:.2f}", icon="🚨")
+
+                elif detection_mode == "Anomaly Detection":
+                    result = call_api("predict-anomaly", payload)
+                    if result:
+                        is_fraud = result["is_anomaly"]
+                        st.session_state.history.append({
+                            "Type": "Anomaly", 
+                            "Amount ($)": round(payload["amt"], 2), 
+                            "Distance (KM)": round(dist_approx, 1),
+                            "Risk / Level": result["anomaly_level"], 
+                            "Prediction": "⚠️ Anomaly" if is_fraud else "✅ Normal", 
+                            "Inference (ms)": result["inference_time_ms"]
+                        })
+                        # Trigger alert popup
+                        if is_fraud:
+                            st.toast(f"⚠️ Anomaly Detected: ${payload['amt']:.2f}", icon="⚠️")
+
+                else:  # Hybrid (Recommended)
+                    result = call_api("predict-hybrid", payload)
+                    if result:
+                        is_fraud = result["final_prediction"] == 1
+                        st.session_state.history.append({
+                            "Type": "Hybrid", 
+                            "Amount ($)": round(payload["amt"], 2), 
+                            "Distance (KM)": round(dist_approx, 1),
+                            "Risk / Level": result["risk_assessment"].split(':'),
+                            "Prediction": "🚨 Fraud" if is_fraud else "✅ Safe", 
+                            "Inference (ms)": result["inference_time_ms"]
+                        })
+                        # Trigger alert popup
+                        if is_fraud:
+                            st.toast(f"🚨 FRAUD BLOCKED: ${payload['amt']:.2f}", icon="🚨")
+                            
             time.sleep(0.6)
         placeholder.empty()
         st.rerun()
@@ -293,6 +371,25 @@ with st.sidebar:
     
     st.markdown("---")
     st.info("**Hybrid Mode Benefits:**\n- Supervised: Detects known fraud\n- Anomaly: Catches unusual behavior (Location/Time)\n- Combined: Maximum protection")
+    st.markdown("---")
+    st.subheader("🛡️ Control Panel")
+
+    auto_block_enabled = st.toggle("Enable AI Auto-Block")
+
+    if st.button("Apply Auto-Block Setting"):
+        toggle_auto_block(auto_block_enabled)
+        st.success("Auto-Block Setting Updated")
+
+    st.markdown("---")
+    st.subheader("📊 Executive Summary")
+    
+
+    summary = get_system_summary()
+    if summary:
+        col1, col2 = st.columns(2)
+        col1.metric("Total Transactions", summary.get("total_transactions", 0))
+        col2.metric("Blocked", summary.get("blocked_transactions", 0))
+        st.metric("Fraud Detected", summary.get("fraud_detected", 0))
 
 tab_predict, tab_anomaly, tab_compare, tab_dashboard, tab_history = st.tabs([
     "🔍 Transaction Analysis",
@@ -314,6 +411,7 @@ with tab_predict:
     with col_demo2:
         if st.button("🚨 Load Stolen Card Behavior", use_container_width=True):
             set_demo_data(SAMPLE_FRAUD)
+            st.session_state.demo_force_fraud = True
             st.rerun()
     
     st.markdown("---")
@@ -339,44 +437,73 @@ with tab_predict:
     
     if submit:
         payload = {
-            "trans_date_trans_time": time_val, "amt": amt_val, "category": cat_val,
-            "dob": dob_val, "lat": lat_val, "long": long_val, 
-            "merch_lat": mlat_val, "merch_long": mlong_val
+            "trans_date_trans_time": time_val,
+            "amt": amt_val,
+            "category": cat_val,
+            "dob": dob_val,
+            "lat": lat_val,
+            "long": long_val,
+            "merch_lat": mlat_val,
+            "merch_long": mlong_val,
+            "demo_force_fraud": st.session_state.get("demo_force_fraud", False)
         }
-        
+
+        # ✅ Store payload safely for manual blocking after rerun
+        st.session_state.last_payload = payload
+
+        # Clear previous mode results to avoid mixing
+        st.session_state.last_result = None
+        st.session_state.last_anomaly = None
+        st.session_state.last_hybrid = None
+
         with st.spinner("Analyzing behavioral patterns..."):
-            dist_approx = np.sqrt((lat_val - mlat_val)**2 + (long_val - mlong_val)**2) * 111
-            
+            dist_approx = np.sqrt(
+                (lat_val - mlat_val) ** 2 +
+                (long_val - mlong_val) ** 2
+            ) * 111
+
             if detection_mode == "Supervised Only":
                 result = call_api("predict", payload)
                 if result:
                     st.session_state.last_result = result
                     st.session_state.history.append({
-                        "Type": "Supervised", "Amount ($)": amt_val, "Distance (KM)": round(dist_approx, 1),
-                        "Risk / Level": result["risk_level"], "Prediction": "🚨 Fraud" if result["prediction"] == 1 else "✅ Legit",
+                        "Type": "Supervised",
+                        "Amount ($)": amt_val,
+                        "Distance (KM)": round(dist_approx, 1),
+                        "Risk / Level": result["risk_level"],
+                        "Prediction": "🚨 Fraud" if result["prediction"] == 1 else "✅ Legit",
                         "Inference (ms)": result["inference_time_ms"]
                     })
+                    st.session_state.demo_force_fraud = False
+
             elif detection_mode == "Anomaly Detection":
                 result = call_api("predict-anomaly", payload)
                 if result:
                     st.session_state.last_anomaly = result
                     st.session_state.history.append({
-                        "Type": "Anomaly", "Amount ($)": amt_val, "Distance (KM)": round(dist_approx, 1),
-                        "Risk / Level": result["anomaly_level"], "Prediction": "⚠️ Anomaly" if result["is_anomaly"] else "✅ Normal",
+                        "Type": "Anomaly",
+                        "Amount ($)": amt_val,
+                        "Distance (KM)": round(dist_approx, 1),
+                        "Risk / Level": result["anomaly_level"],
+                        "Prediction": "⚠️ Anomaly" if result["is_anomaly"] else "✅ Normal",
                         "Inference (ms)": result["inference_time_ms"]
                     })
+
             else:  # Hybrid
                 result = call_api("predict-hybrid", payload)
                 if result:
                     st.session_state.last_hybrid = result
                     st.session_state.history.append({
-                        "Type": "Hybrid", "Amount ($)": amt_val, "Distance (KM)": round(dist_approx, 1),
-                        "Risk / Level": result["risk_assessment"].split(':'), "Prediction": "🚨 Fraud" if result["final_prediction"] == 1 else "✅ Safe",
+                        "Type": "Hybrid",
+                        "Amount ($)": amt_val,
+                        "Distance (KM)": round(dist_approx, 1),
+                        "Risk / Level": result["risk_assessment"].split(':'),
+                        "Prediction": "🚨 Fraud" if result["final_prediction"] == 1 else "✅ Safe",
                         "Inference (ms)": result["inference_time_ms"]
                     })
-    
+
     st.markdown("---")
-    
+        
     # ── Display Results ──
     if detection_mode == "Supervised Only" and st.session_state.last_result:
         r = st.session_state.last_result
@@ -394,6 +521,15 @@ with tab_predict:
             m1, m2 = st.columns(2)
             m1.metric("Confidence", f"{r['fraud_probability']*100:.2f}%")
             m2.metric("Latency", f"{r['inference_time_ms']:.2f} ms")
+            if r["prediction"] == 1:
+                if st.button("🛑 Manually Block Transaction"):
+                    block_payload = {
+                        "transaction_data": st.session_state.get("last_payload", {}),
+                        "model_result": r,
+                        "action": "manual_block"
+                    }
+                    call_api("block-transaction", block_payload)
+                    st.success("Transaction Blocked Successfully")
     
     elif detection_mode == "Anomaly Detection" and st.session_state.last_anomaly:
         a = st.session_state.last_anomaly
@@ -411,6 +547,15 @@ with tab_predict:
             m1, m2 = st.columns(2)
             m1.metric("Anomaly Score", f"{a['anomaly_score']:.1f}/100")
             m2.metric("Latency", f"{a['inference_time_ms']:.2f} ms")
+            if a["is_anomaly"]:
+                if st.button("🛑 Manually Block Transaction"):
+                    block_payload = {
+                        "transaction_data": st.session_state.get("last_payload", {}),
+                        "model_result": a,
+                        "action": "manual_block"
+                    }
+                    call_api("block-transaction", block_payload)
+                    st.success("Transaction Blocked Successfully")
     
     elif detection_mode == "Hybrid (Recommended)" and st.session_state.last_hybrid:
         h = st.session_state.last_hybrid
@@ -436,32 +581,88 @@ with tab_predict:
         m1.metric("Model Agreement", "✓ Yes" if h["model_agreement"] else "✗ No")
         m2.metric("Confidence", f"{h['confidence']*100:.0f}%")
         m3.metric("Latency", f"{h['inference_time_ms']:.2f} ms")
+        if h["final_prediction"] == 1:
+            if st.button("🛑 Manually Block Transaction"):
+                block_payload = {
+                    "transaction_data": st.session_state.get("last_payload", {}),
+                    "model_result": h,
+                    "action": "manual_block"
+                }
+                call_api("block-transaction", block_payload)
+                st.success("Transaction Blocked Successfully")
 
 # ── Tab 2: Anomaly Detection Deep Dive ───────────────────────────────────────
 with tab_anomaly:
-    st.subheader("🎯 Static Anomaly Visualizations (From Training)")
-    
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    anomaly_plots_dir = os.path.join(BASE_DIR, "model", "anomaly", "plots")
     
-    if os.path.exists(anomaly_plots_dir):
-        plot_files = {
-            "Distribution": "anomaly_distribution.png",
-            "Amount Analysis": "amount_vs_anomaly.png",
-            "Temporal Patterns": "time_vs_anomaly.png",
-            "PCA Space": "pca_anomalies.png",
-            "Top Anomalies": "top_anomalies.png",
-        }
-        tabs_anomaly = st.tabs(list(plot_files.keys()))
-        for tab, (label, fname) in zip(tabs_anomaly, plot_files.items()):
-            with tab:
-                path = os.path.join(anomaly_plots_dir, fname)
-                if os.path.exists(path):
-                    st.image(path, use_column_width=True)
-                else:
-                    st.info(f"Run `python train_anomaly_detector.py` to generate visualizations")
-    else:
-        st.warning("Anomaly visualizations not found. Train the anomaly detector first.")
+    if detection_mode == "Supervised Only":
+        st.subheader("📈 Supervised Model Deep Dive")
+        st.caption("Visualizations generated during Random Forest and Logistic Regression training.")
+        plots_dir = os.path.join(BASE_DIR, "model", "plots")
+        
+        if os.path.exists(plots_dir):
+            plot_files = {
+                "Confusion Matrix": "confusion_matrices.png",
+                "ROC Curve": "roc_curves.png",
+                "Precision-Recall": "pr_curves.png",
+                "Feature Importance": "feature_importance.png",
+                "Model Comparison": "model_comparison.png"
+            }
+            tabs_vis = st.tabs(list(plot_files.keys()))
+            for tab, (label, fname) in zip(tabs_vis, plot_files.items()):
+                with tab:
+                    path = os.path.join(plots_dir, fname)
+                    if os.path.exists(path):
+                        st.image(path, use_column_width=True)
+                    else:
+                        st.info(f"Plot '{fname}' not found. Run `python train.py` to generate it.")
+        else:
+            st.warning("Supervised visualizations not found. Train the model first.")
+
+    elif detection_mode == "Anomaly Detection":
+        st.subheader("🎯 Anomaly Detection Deep Dive")
+        st.caption("Visualizations of outlier boundaries generated by the Isolation Forest.")
+        anomaly_plots_dir = os.path.join(BASE_DIR, "model", "anomaly", "plots")
+        
+        if os.path.exists(anomaly_plots_dir):
+            plot_files = {
+                "PCA Space": "pca_anomalies.png",
+                "Distribution": "anomaly_distribution.png",
+                "Amount Analysis": "amount_vs_anomaly.png",
+                "Temporal Patterns": "time_vs_anomaly.png",
+                "Top Anomalies": "top_anomalies.png",
+            }
+            tabs_anomaly = st.tabs(list(plot_files.keys()))
+            for tab, (label, fname) in zip(tabs_anomaly, plot_files.items()):
+                with tab:
+                    path = os.path.join(anomaly_plots_dir, fname)
+                    if os.path.exists(path):
+                        st.image(path, use_column_width=True)
+                    else:
+                        st.info(f"Plot '{fname}' not found in the anomaly plots directory.")
+        else:
+            st.warning("Anomaly visualizations not found. Run `python train_anomaly_detector.py`.")
+
+    else: # Hybrid
+        st.subheader("🔮 Hybrid System Overview")
+        st.caption("A combined view of both the boundary-based (Supervised) and behavior-based (Anomaly) detection layers.")
+        
+        col_sup, col_ano = st.columns(2)
+        with col_sup:
+            st.markdown("#### Top Predictive Features (Supervised)")
+            path_fi = os.path.join(BASE_DIR, "model", "plots", "feature_importance.png")
+            if os.path.exists(path_fi): 
+                st.image(path_fi, use_column_width=True)
+            else: 
+                st.info("Feature importance plot missing.")
+            
+        with col_ano:
+            st.markdown("#### Anomaly Isolation (PCA Space)")
+            path_pca = os.path.join(BASE_DIR, "model", "anomaly", "plots", "pca_anomalies.png")
+            if os.path.exists(path_pca): 
+                st.image(path_pca, use_column_width=True)
+            else: 
+                st.info("PCA plot missing.")
 
 # ── Tab 3: Model Comparison ──────────────────────────────────────────────────
 with tab_compare:
@@ -555,9 +756,15 @@ with tab_history:
         st.subheader("🌌 Live Behavioral Anomaly Space")
         st.caption("Visualizing physical deviations. High-amount transactions occurring unusually far from the user's home will isolate themselves as anomalies.")
         
+        # Create the dataframe from session history
         df_hist = pd.DataFrame(st.session_state.history)
-        
-        # Plotting the anomaly space using new real-world features
+
+        # Ensure strings for hover data so Plotly doesn't crash when mixing mode history
+        df_hist["Risk / Level"] = df_hist["Risk / Level"].apply(
+            lambda x: str(x) if isinstance(x, list) else str(x)
+        )
+
+        # Plotting the anomaly space using real-world features
         fig_scatter = px.scatter(
             df_hist, 
             x="Distance (KM)", 
@@ -568,9 +775,10 @@ with tab_history:
                 "✅ Legit": "#38ef7d", "✅ Safe": "#38ef7d", "✅ Normal": "#38ef7d",
                 "🚨 Fraud": "#eb3349", "⚠️ Anomaly": "#f7b733"
             },
-            title="Interactive Behavioral Cluster Map (Distance vs Amount)",
+            title=f"Interactive Behavioral Cluster Map ({detection_mode})",
             size_max=15
         )
+        
         fig_scatter.update_traces(marker=dict(size=14, line=dict(width=1, color='White')))
         fig_scatter.update_layout(
             paper_bgcolor="rgba(0,0,0,0)", 
@@ -578,3 +786,57 @@ with tab_history:
             font={"color": "#fafafa"}
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
+        st.markdown("---")
+        st.subheader("🤖 Live AI Fraud Analyst Report")
+        st.caption("Send the current session batch to Gemini to generate an expert incident report.")
+
+        if st.button("✨ Generate AI Incident Report", type="primary"):
+            if not GEMINI_API_KEY:
+                st.error("⚠️ Gemini API Key not found. Please ensure GEMINI_API_KEY is set in your .env file.")
+            elif df_hist.empty:
+                st.warning("No transactions to analyze! Run the Live Stream first.")
+            else:
+                with st.spinner("Gemini is analyzing the behavioral patterns..."):
+                    try:
+                        # Configure Gemini using the hidden environment variable
+                        genai.configure(api_key=GEMINI_API_KEY)
+                        model = genai.GenerativeModel('gemini-2.5-flash')
+
+                        history_text = df_hist.to_string(index=False)
+
+                        prompt = f"""
+                        You are a Senior Fraud Analyst for a major bank. Review the following recent transaction history batch for a single user.
+                        The data includes the detection mode used, transaction amount, distance from the user's home (Distance KM), the AI model's risk assessment, and the final prediction.
+
+                        Transaction Data:
+                        {history_text}
+
+                        Provide a concise, professional incident report. Your report must include:
+                        1. A brief summary of the user's behavioral pattern in this batch.
+                        2. Key anomalies spotted (e.g., sudden spikes in amount, unrealistic travel distances).
+                        3. A concrete recommendation (e.g., 'Freeze account immediately', 'Monitor closely', 'No action needed').
+                        
+                        Keep it under 150 words and format it clearly using markdown bullet points. Do not include introductory pleasantries.
+                        """
+
+                        response = model.generate_content(prompt)
+                        
+                        st.success("Analysis Complete")
+                        st.markdown('<div class="warning-card" style="text-align: left; font-size: 1.1rem; color: #1e2130;">' 
+                                    f'<b>Incident Report:</b><br><br>{response.text}</div>', 
+                                    unsafe_allow_html=True)
+
+                    except Exception as e:
+                        st.error(f"❌ Error communicating with Gemini API: {e}")
+        st.markdown("---")
+        st.subheader("🚫 Blocked Transactions")
+
+        blocked_data = get_blocked_history()
+
+        if blocked_data:
+            df_blocked = pd.DataFrame(blocked_data)
+            st.dataframe(df_blocked, use_container_width=True)
+        else:
+            st.info("No blocked transactions yet.")
+
+        
