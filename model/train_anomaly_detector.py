@@ -159,50 +159,69 @@ def evaluate_anomaly_detector(model, X_test, y_test, threshold, min_score, max_s
 # 5. VISUALIZATION (FIXED)
 # ════════════════════════════════════════════════════════════════════════════
 
-def visualize_anomalies(X_test_scaled, anomaly_scores, y_test, save_dir):
-
+def visualize_anomalies(X_test_scaled, X_test_full, anomaly_scores, y_test, save_dir):
     os.makedirs(save_dir, exist_ok=True)
-
+    sns.set_style("darkgrid")
+    
     legit_mask = y_test == 0
     fraud_mask = y_test == 1
 
-    # PCA FIXED
+    # 1. PCA Space (Your existing one)
     pca = PCA(n_components=2)
     X_pca = pca.fit_transform(X_test_scaled)
-
     plt.figure(figsize=(10, 8))
-
-    plt.scatter(
-        X_pca[legit_mask, 0],
-        X_pca[legit_mask, 1],
-        c=anomaly_scores[legit_mask],
-        cmap='YlOrRd',
-        alpha=0.4,
-        s=20
-    )
-
-    plt.scatter(
-        X_pca[fraud_mask, 0],
-        X_pca[fraud_mask, 1],
-        c='red',
-        marker='X',
-        s=200,
-        edgecolors='black',
-        label='Actual Fraud'
-    )
-
-    plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-    plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+    plt.scatter(X_pca[legit_mask, 0], X_pca[legit_mask, 1], c=anomaly_scores[legit_mask], cmap='YlOrRd', alpha=0.4, s=20)
+    plt.scatter(X_pca[fraud_mask, 0], X_pca[fraud_mask, 1], c='red', marker='X', s=200, edgecolors='black', label='Actual Fraud')
+    plt.xlabel(f'PC1 ({pca.explained_variance_ratio_:.2%} variance)')
+    plt.ylabel(f'PC2 ({pca.explained_variance_ratio_:.2%} variance)')
     plt.title('Anomaly Detection in PCA Space')
     plt.legend()
-    plt.grid(alpha=0.3)
-
-    plt.savefig(os.path.join(save_dir, 'pca_anomalies.png'), dpi=150)
+    plt.savefig(os.path.join(save_dir, 'pca_anomalies.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
-    log.info("Saved: pca_anomalies.png")
+    # 2. Anomaly Distribution
+    plt.figure(figsize=(10, 6))
+    sns.histplot(anomaly_scores, bins=50, kde=True, color='purple')
+    plt.axvline(x=88, color='red', linestyle='--', label='Threshold (88)') # Based on your main logic
+    plt.title('Distribution of Anomaly Scores')
+    plt.xlabel('Anomaly Score (0-100)')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.savefig(os.path.join(save_dir, 'anomaly_distribution.png'), dpi=150, bbox_inches='tight')
+    plt.close()
 
+    # 3. Amount vs Anomaly Score
+    plt.figure(figsize=(10, 6))
+    plt.scatter(X_test_full['Amount'], anomaly_scores, alpha=0.5, c=anomaly_scores, cmap='coolwarm')
+    plt.title('Transaction Amount vs. Anomaly Score')
+    plt.xlabel('Transaction Amount ($)')
+    plt.ylabel('Anomaly Score')
+    plt.axhline(y=88, color='red', linestyle='--', alpha=0.7)
+    plt.savefig(os.path.join(save_dir, 'amount_vs_anomaly.png'), dpi=150, bbox_inches='tight')
+    plt.close()
 
+    # 4. Temporal Patterns (Hour of Day)
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x=X_test_full['Hour_of_Day'], y=anomaly_scores, palette='viridis')
+    plt.title('Anomaly Scores by Hour of the Day')
+    plt.xlabel('Hour of Day (0-23)')
+    plt.ylabel('Anomaly Score')
+    plt.savefig(os.path.join(save_dir, 'time_vs_anomaly.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # 5. Top Anomalies (Bar chart of the top 20 most anomalous transactions)
+    plt.figure(figsize=(10, 6))
+    top_indices = np.argsort(anomaly_scores)[-20:]
+    top_scores = anomaly_scores[top_indices]
+    plt.barh(range(20), top_scores, color='crimson')
+    plt.title('Top 20 Highest Anomaly Scores')
+    plt.xlabel('Anomaly Score')
+    plt.ylabel('Transaction Index')
+    plt.yticks(range(20), top_indices)
+    plt.savefig(os.path.join(save_dir, 'top_anomalies.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    log.info("Saved all anomaly visualization plots.")
 # ════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════════
@@ -241,6 +260,7 @@ def main():
 
     visualize_anomalies(
         X_test_scaled,
+        X_test_full,     # <-- We added this line
         anomaly_scores,
         y_test_full,
         os.path.join(ANOMALY_DIR, "plots")

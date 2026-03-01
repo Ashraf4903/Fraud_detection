@@ -290,7 +290,7 @@ async def predict_hybrid(req: TransactionRequest, api_key: str = Depends(verify_
 
     agreement = rf_flag == iso_flag
     if req.demo_force_fraud:
-        final, conf, assess = 1, 0.99, "DEMO MODE: Forced Fraud Scenario"
+        final, conf, assess = 1, 0.99, "CRITICAL: High-Risk Geographic & Amount Anomaly"
     else:
         if rf_flag and iso_flag:
             final, conf, assess = 1, 0.95, "CRITICAL: Dual Model Detection"
@@ -345,7 +345,22 @@ async def block_transaction(req: BlockActionRequest, api_key: str = Depends(veri
     }
     blocked_transactions.append(entry)
     return {"status":"blocked","details":entry}
+class UnblockRequest(BaseModel):
+    timestamp: str
 
+@app.post("/unblock-transaction")
+async def unblock_transaction(req: UnblockRequest, api_key: str = Depends(verify_api_key)):
+    global blocked_transactions
+    original_len = len(blocked_transactions)
+    
+    # Keep only the transactions that DO NOT match the requested timestamp
+    blocked_transactions = [t for t in blocked_transactions if t.get("timestamp") != req.timestamp]
+    
+    if len(blocked_transactions) < original_len:
+        return {"status": "success", "message": "Transaction unblocked."}
+    else:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
+    
 @app.get("/blocked-history")
 async def blocked_history(api_key: str = Depends(verify_api_key)):
     return {"blocked": blocked_transactions}

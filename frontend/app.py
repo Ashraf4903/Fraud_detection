@@ -20,14 +20,13 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 import google.generativeai as genai
+import sqlite3        # <-- NEW: Local database
+import hashlib        # <-- NEW: Password security
+from dotenv import load_dotenv
+from streamlit_oauth import OAuth2Component
 from typing import Optional, Dict
-from dotenv import load_dotenv  # <-- Add this!
 
-# ── API Settings ─────────────────────────────────────────────────────────────
-# Force Python to read the .env file in your folder
-load_dotenv()
-
-# ── Page Config ──────────────────────────────────────────────────────────────
+# 1. 🛑 THIS MUST BE THE VERY FIRST STREAMLIT COMMAND
 st.set_page_config(
     page_title="Behavioral Fraud Defense",
     page_icon="🛡️",
@@ -35,11 +34,78 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Local Database Authentication Setup ──────────────────────────────────────
+def init_db():
+    """Initializes the SQLite database for local user accounts."""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            full_name TEXT,
+            password_hash TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def hash_password(password):
+    """Securely hashes the password using SHA-256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def create_user(full_name, email, password):
+    """Registers a new user in the database with validation."""
+    
+    if "@" not in email or "." not in email:
+        return "invalid_email"
+    
+    if len(password) < 6:
+        return "weak_password"
+
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+
+    try:
+        c.execute(
+            "INSERT INTO users (email, full_name, password_hash) VALUES (?, ?, ?)",
+            (email, full_name, hash_password(password))
+        )
+        conn.commit()
+        return "success"
+    except sqlite3.IntegrityError:
+        return "exists"
+    finally:
+        conn.close()
+
+def verify_user(email, password):
+    """Verifies login credentials."""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE email=?", (email,))
+    result = c.fetchone()
+    conn.close()
+
+    if result and result[0] == hash_password(password):
+        return True
+    return False
+
+# Initialize the database on app startup
+init_db()
+
 # ── API Settings ─────────────────────────────────────────────────────────────
+load_dotenv() 
+
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 API_KEY = os.getenv("FRAUD_API_KEY", "demo-api-key-change-in-production")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+
+# ── Google OAuth Settings ────────────────────────────────────────────────────
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
 # ── Session State ────────────────────────────────────────────────────────────
 if 'last_result' not in st.session_state:
@@ -52,7 +118,135 @@ if 'history' not in st.session_state:
     st.session_state.history = []
 if "demo_force_fraud" not in st.session_state:
     st.session_state.demo_force_fraud = False
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'user_email' not in st.session_state:
+    st.session_state.user_email = ""
 
+# ── Kaggle-Style Login Page ──────────────────────────────────────────────────
+# ── Kaggle-Style Login Page ──────────────────────────────────────────────────
+if not st.session_state.logged_in:
+    
+    # Advanced CSS to recreate the EXACT White Kaggle Card UI from the screenshot
+    st.markdown("""
+    <style>
+        /* Dark background for the app */
+        .stApp { background-color: #0e1117; } 
+        [data-testid="collapsedControl"] { display: none; }
+        
+        /* The White Card: Targeting the specific Streamlit column container */
+        div[data-testid="column"]:nth-of-type(2) {
+            background-color: #ffffff !important;
+            border-radius: 24px;
+            padding: 50px 40px;
+            box-shadow: 0px 8px 30px rgba(0, 0, 0, 0.5);
+            position: relative;
+            overflow: hidden;
+            border: 1px solid #e0e0e0;
+        }
+        
+        /* Force dark text inside the white card for readability */
+        div[data-testid="column"]:nth-of-type(2) h1, 
+        div[data-testid="column"]:nth-of-type(2) h2, 
+        div[data-testid="column"]:nth-of-type(2) p,
+        div[data-testid="column"]:nth-of-type(2) label,
+        div[data-testid="column"]:nth-of-type(2) span {
+            color: #202124 !important;
+        }
+
+        /* Pill-shaped buttons to match the reference image */
+        div[data-testid="column"]:nth-of-type(2) .stButton > button {
+            border-radius: 40px !important;
+            border: 1px solid #dadce0 !important;
+            background-color: #ffffff !important;
+            color: #3c4043 !important;
+            font-weight: 600 !important;
+            width: 100% !important;
+            margin-bottom: 8px;
+        }
+        
+        /* The colorful Kaggle swoosh in the bottom right */
+        div[data-testid="column"]:nth-of-type(2)::after {
+            content: "";
+            position: absolute;
+            bottom: -40px;
+            right: -40px;
+            width: 140px;
+            height: 140px;
+            background: linear-gradient(135deg, #00d2ff 0%, #a8eb12 100%);
+            border-radius: 50%;
+            opacity: 0.9;
+            z-index: 0;
+        }
+        
+        /* Ensure inputs look clean on white background */
+        div[data-testid="column"]:nth-of-type(2) input {
+            background-color: #f8f9fa !important;
+            color: #202124 !important;
+            border: 1px solid #dfe1e5 !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    
+    # FIX: Define weights [1.5, 1.2, 1.5] to resolve the 'spec' TypeError
+    col1, col2, col3 = st.columns([1.5, 1.2, 1.5])
+    
+    with col2:
+        # Move everything INSIDE this column so it sits on the white background
+        st.markdown("<h2 style='text-align: center; color: #00A6D6 !important; font-weight: 900; margin-bottom: 0;'>Behavioural Fraud Detection System</h2>", unsafe_allow_html=True)
+        st.markdown("<h1 style='text-align: center; font-weight: 800; margin-top: 0;'>Welcome!</h1>", unsafe_allow_html=True)
+
+        tab_signin, tab_register = st.tabs(["Sign In", "Register"])
+
+        with tab_signin:
+            # 1. Real Google OAuth
+            oauth2 = OAuth2Component(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTHORIZE_URL, TOKEN_URL, REVOKE_URL, "google_oauth_fraud_system")
+            result = oauth2.authorize_button("Sign in with Google", icon="https://www.google.com/favicon.ico", redirect_uri="http://localhost:8501", scope="openid email profile", key="google_login_button", use_container_width=True)
+            
+            if result and "token" in result:
+                st.session_state.logged_in = True
+                st.rerun()
+
+            st.markdown("<p style='text-align:center; font-weight:bold; margin:15px 0; color:#5f6368 !important;'>OR</p>", unsafe_allow_html=True)
+
+            # 2. Email Login Form
+            with st.form("email_login_form"):
+                login_email = st.text_input("Email Address")
+                login_password = st.text_input("Password", type="password")
+                if st.form_submit_button("Sign In with Email", use_container_width=True):
+                    if verify_user(login_email, login_password):
+                        st.session_state.logged_in = True
+                        st.session_state.user_email = login_email
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid credentials")
+
+        with tab_register:
+            # 3. Registration Form
+            with st.form("register_form"):
+                reg_name = st.text_input("Full Name")
+                reg_email = st.text_input("Work Email")
+                reg_password = st.text_input("Password", type="password")
+                if st.form_submit_button("Create Account", use_container_width=True):
+                    res = create_user(reg_name, reg_email, reg_password)
+                    if res == "success": 
+                        st.success("✅ Account created! Switch to Sign In.")
+                    elif res == "exists":
+                        st.error("❌ Email already registered.")
+                    else:
+                        st.error(f"❌ Error: {res}")
+
+    # Prevent the rest of the dashboard from loading
+    st.stop()
+
+# ── Add a Logout Button to the Sidebar ──
+with st.sidebar:
+    if st.button("🚪 Logout", use_container_width=True):
+        st.session_state.logged_in = False
+        st.session_state.history = []
+        st.rerun()
 # ── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -807,7 +1001,7 @@ with tab_history:
             elif df_hist.empty:
                 st.warning("No transactions to analyze! Run the Live Stream first.")
             else:
-                with st.spinner("Gemini is analyzing the behavioral patterns..."):
+                with st.spinner("AI is analyzing the behavioral patterns..."):
                     try:
                         # Configure Gemini using the hidden environment variable
                         genai.configure(api_key=GEMINI_API_KEY)
@@ -839,15 +1033,78 @@ with tab_history:
 
                     except Exception as e:
                         st.error(f"❌ Error communicating with Gemini API: {e}")
+
+        # ==========================================
+        # NEW SECTION: EMERGENCY ACTION PANEL
+        # ==========================================
         st.markdown("---")
-        st.subheader("🚫 Blocked Transactions")
+        st.subheader("🛡️ Incident Response")
+        st.caption("Take immediate manual action based on the AI analyst's recommendation.")
+        
+        col_act1, col_act2 = st.columns(2)
+        
+        with col_act1:
+            if st.button("🛑 EMERGENCY ACCOUNT BLOCK", type="primary", use_container_width=True):
+                if not st.session_state.history:
+                    st.warning("No active session data to block.")
+                else:
+                    # Send a batch-level block command to the backend
+                    block_payload = {
+                        "transaction_data": {"batch_size": len(st.session_state.history), "source": "Live Stream Batch"},
+                        "model_result": {"risk_assessment": "Manual Emergency Block via AI Analyst Review", "confidence": 1.0},
+                        "action": "manual_account_freeze"
+                    }
+                    call_api("block-transaction", block_payload)
+                    st.success("✅ Account successfully locked. All pending transactions blocked.")
+                    st.balloons()
+                    
+        with col_act2:
+            if st.button("⚠️ Flag for Tier-2 Review", use_container_width=True):
+                if not st.session_state.history:
+                    st.warning("No active session data to flag.")
+                else:
+                    st.info("📋 Batch successfully flagged and forwarded to the Tier-2 human review queue.")
+        st.markdown("---")
+        st.markdown("---")
+        st.subheader("🚫 Blocked Transactions & Resolution")
+        st.caption("Review locked accounts and reverse false positives.")
 
         blocked_data = get_blocked_history()
 
         if blocked_data:
+            # 1. Show the table
             df_blocked = pd.DataFrame(blocked_data)
             st.dataframe(df_blocked, use_container_width=True)
+            
+            # 2. Add the Revert UI right below the table
+            st.markdown("#### 🔄 Revert Falsely Blocked Transaction")
+            
+            # Create a dictionary mapping a readable label to the timestamp ID
+            block_options = {}
+            for b in blocked_data:
+                # Ensure the data has a timestamp before trying to map it
+                if 'timestamp' in b:
+                    label = f"{b['timestamp']} | Reason: {b.get('reason', 'N/A')} | Conf: {b.get('confidence',0)*100:.0f}%"
+                    block_options[label] = b['timestamp']
+            
+            if block_options:
+                selected_block = st.selectbox("Select transaction to restore:", options=list(block_options.keys()))
+                
+                if st.button("↩️ Revert & Unblock Account", type="secondary"):
+                    timestamp_to_unblock = block_options[selected_block]
+                    
+                    try:
+                        requests.post(
+                            f"{API_URL}/unblock-transaction", 
+                            json={"timestamp": timestamp_to_unblock}, 
+                            headers=HEADERS,
+                            timeout=5
+                        )
+                        st.success("✅ Transaction restored successfully. False positive logged for model retraining.")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to unblock: {e}")
         else:
-            st.info("No blocked transactions yet.")
-
+            st.info("No blocked transactions currently in the queue.")
         
