@@ -522,14 +522,18 @@ with tab_predict:
             m1.metric("Confidence", f"{r['fraud_probability']*100:.2f}%")
             m2.metric("Latency", f"{r['inference_time_ms']:.2f} ms")
             if r["prediction"] == 1:
-                if st.button("🛑 Manually Block Transaction"):
+                st.toast("🚨 CRITICAL: Fraudulent behavior detected!", icon="🚨")
+                st.error("⚠️ **ACTION REQUIRED:** This transaction matches known fraud profiles.")
+                
+                if st.button("🛑 BLOCK ACCOUNT & TRANSACTION", type="primary", use_container_width=True):
                     block_payload = {
                         "transaction_data": st.session_state.get("last_payload", {}),
                         "model_result": r,
                         "action": "manual_block"
                     }
                     call_api("block-transaction", block_payload)
-                    st.success("Transaction Blocked Successfully")
+                    st.success("✅ Transaction Successfully Blocked. Account flagged.")
+                    st.balloons()
     
     elif detection_mode == "Anomaly Detection" and st.session_state.last_anomaly:
         a = st.session_state.last_anomaly
@@ -548,15 +552,18 @@ with tab_predict:
             m1.metric("Anomaly Score", f"{a['anomaly_score']:.1f}/100")
             m2.metric("Latency", f"{a['inference_time_ms']:.2f} ms")
             if a["is_anomaly"]:
-                if st.button("🛑 Manually Block Transaction"):
+                st.toast("⚠️ WARNING: Severe behavioral anomaly detected!", icon="⚠️")
+                st.error("⚠️ **ACTION REQUIRED:** This transaction deviates significantly from the user's normal behavior.")
+                
+                if st.button("🛑 BLOCK ACCOUNT & TRANSACTION", type="primary", use_container_width=True):
                     block_payload = {
                         "transaction_data": st.session_state.get("last_payload", {}),
                         "model_result": a,
                         "action": "manual_block"
                     }
                     call_api("block-transaction", block_payload)
-                    st.success("Transaction Blocked Successfully")
-    
+                    st.success("✅ Transaction Successfully Blocked. Account flagged.")
+                    st.balloons()
     elif detection_mode == "Hybrid (Recommended)" and st.session_state.last_hybrid:
         h = st.session_state.last_hybrid
         st.subheader("🔮 Hybrid Analysis Results")
@@ -582,14 +589,18 @@ with tab_predict:
         m2.metric("Confidence", f"{h['confidence']*100:.0f}%")
         m3.metric("Latency", f"{h['inference_time_ms']:.2f} ms")
         if h["final_prediction"] == 1:
-            if st.button("🛑 Manually Block Transaction"):
+            st.toast("🚨 CRITICAL: Fraudulent behavior detected!", icon="🚨")
+            st.error(f"⚠️ **ACTION REQUIRED:** {h['risk_assessment']}")
+            
+            if st.button("🛑 BLOCK ACCOUNT & TRANSACTION", type="primary", use_container_width=True):
                 block_payload = {
                     "transaction_data": st.session_state.get("last_payload", {}),
                     "model_result": h,
                     "action": "manual_block"
                 }
                 call_api("block-transaction", block_payload)
-                st.success("Transaction Blocked Successfully")
+                st.success("✅ Transaction Successfully Blocked. Account flagged.")
+                st.balloons()
 
 # ── Tab 2: Anomaly Detection Deep Dive ───────────────────────────────────────
 with tab_anomaly:
