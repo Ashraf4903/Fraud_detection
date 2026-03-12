@@ -970,11 +970,10 @@ copies or substantial portions of the Software.
 
 ---
 
-## 📞 Contact & Support
+## Contact & Support
 
 - **Issues**: [GitHub Issues](https://github.com/yourusername/fraud-detection-system/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/fraud-detection-system/discussions)
-- **Email**: your.email@example.com
 
 ---
 
